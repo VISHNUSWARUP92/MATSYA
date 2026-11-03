@@ -1,9 +1,13 @@
 {
-  "model_type": "TF-IDF + Logistic Regression",
-  "training_examples": 16,
+  "model_type": "TF-IDF (Unigram + Bigram) + Logistic Regression",
+  "training_examples": 32,
+  "phishing_examples": 16,
+  "legitimate_examples": 16,
   "classes": [
     "legitimate",
     "phishing"
   ],
-  "warning": "Toy demonstration dataset. Predictions are not reliable for real-world phishing detection."
+  "cross_validation_accuracy": 1.0,
+  "cv_folds": 5,
+  "warning": "Demonstration model trained on a small manually created dataset. This model is suitable for hackathon demonstration and decision-support only, not production security detection."
 }

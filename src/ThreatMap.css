@@ -1,1 +1,309 @@
-.matsya-map-wrap{width:100%;min-width:0}.matsya-map-status{display:flex;justify-content:space-between;gap:12px;align-items:center;flex-wrap:wrap;padding:0 0 10px;color:#53718f;font-size:12px}.matsya-map-status .feed-on{color:#047857;font-weight:700}.matsya-map-status .feed-off{color:#b45309;font-weight:700}.matsya-leaflet-map{height:330px;width:100%;z-index:1;border:1px solid #b8dcf6;border-radius:12px;overflow:hidden;background:#dbeafe}.matsya-map-popup{display:grid;gap:5px;max-width:240px;font-size:12px;color:#193b5b}.matsya-map-popup b{font-size:14px}.matsya-map-popup small{margin-top:4px;color:#64748b}.matsya-map-message{display:flex;align-items:center;gap:12px;justify-content:space-between;flex-wrap:wrap;padding:14px 4px 4px;color:#55728d;font-size:12px;line-height:1.55}.matsya-map-message.error{color:#be123c}.matsya-feed-footnote{font-size:10px;line-height:1.5;color:#6b87a2;margin-top:9px}@media(max-width:700px){.matsya-leaflet-map{height:280px}.matsya-map-status{align-items:flex-start;flex-direction:column}}
+.matsya-map-wrap {
+  width: 100%;
+  min-width: 0;
+  overflow: hidden;
+  border: 1px solid #d6e7f7;
+  border-radius: 16px;
+  background: linear-gradient(145deg, #f8fbff 0%, #eef6ff 100%);
+  color: #18324d;
+  box-shadow: 0 10px 30px rgba(36, 91, 145, 0.08);
+}
+
+.matsya-map-header {
+  display: grid;
+  gap: 12px;
+  padding: 14px;
+  border-bottom: 1px solid #dceafa;
+  background: rgba(255, 255, 255, 0.82);
+}
+
+.matsya-map-modes {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.matsya-map-mode-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  min-height: 34px;
+  padding: 7px 11px;
+  border: 1px solid #cbdff2;
+  border-radius: 9px;
+  background: #fff;
+  color: #42617d;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  cursor: pointer;
+  transition: border-color 160ms ease, background 160ms ease, color 160ms ease,
+    transform 160ms ease;
+}
+
+.matsya-map-mode-btn:hover {
+  border-color: #70b5ee;
+  color: #145b9b;
+  transform: translateY(-1px);
+}
+
+.matsya-map-mode-btn.active {
+  border-color: #1684d6;
+  background: #e3f2ff;
+  color: #07599b;
+  box-shadow: inset 0 0 0 1px rgba(22, 132, 214, 0.08);
+}
+
+.matsya-map-stats-strip {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.matsya-map-stat-badge,
+.feed-indicator {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  min-height: 25px;
+  padding: 4px 8px;
+  border: 1px solid #d8e7f5;
+  border-radius: 999px;
+  background: #fff;
+  color: #617b94;
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.045em;
+}
+
+.matsya-map-stat-badge b {
+  color: #173e61;
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+}
+
+.matsya-map-stat-badge.demo-stat {
+  border-color: #d9ddfb;
+  background: #f5f5ff;
+}
+
+.feed-indicator {
+  margin-left: auto;
+}
+
+.feed-indicator.online {
+  border-color: #b8e8d1;
+  background: #effcf5;
+  color: #087447;
+}
+
+.feed-indicator.offline {
+  border-color: #f2d7ad;
+  background: #fff9ee;
+  color: #98601b;
+}
+
+.live-dot {
+  width: 7px;
+  height: 7px;
+  flex: 0 0 7px;
+  border-radius: 50%;
+  background: #e6a23c;
+}
+
+.feed-indicator.online .live-dot {
+  background: #13a76a;
+  box-shadow: 0 0 0 3px rgba(19, 167, 106, 0.12);
+}
+
+.matsya-leaflet-map {
+  z-index: 0;
+  width: 100%;
+  height: clamp(330px, 44vw, 510px);
+  min-height: 330px;
+  background: #dceaf6;
+}
+
+.matsya-leaflet-map .leaflet-control-attribution {
+  font-size: 9px;
+}
+
+.matsya-map-popup {
+  min-width: 220px;
+  max-width: 290px;
+  color: #1d354c;
+  font-family: inherit;
+}
+
+.matsya-map-popup-header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 7px;
+  padding-bottom: 9px;
+  border-bottom: 1px solid #e4edf5;
+}
+
+.matsya-map-popup-header code {
+  color: #173d61;
+  font-size: 11px;
+  font-weight: 800;
+}
+
+.matsya-popup-tag {
+  padding: 4px 6px;
+  border-radius: 5px;
+  background: #e9f4ff;
+  color: #1764a1;
+  font-size: 8px;
+  font-weight: 800;
+  letter-spacing: 0.04em;
+}
+
+.matsya-popup-tag.case {
+  background: #e5f8fc;
+  color: #087a91;
+}
+
+.matsya-popup-tag.demo {
+  background: #fff3dc;
+  color: #965c0c;
+}
+
+.matsya-popup-tag.threat {
+  background: #ffe8ee;
+  color: #b4234c;
+}
+
+.matsya-map-popup-body {
+  display: grid;
+  gap: 8px;
+  padding: 10px 0;
+}
+
+.matsya-map-popup-body > span {
+  display: grid;
+  gap: 2px;
+  font-size: 11px;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+}
+
+.matsya-map-popup-body small {
+  color: #71879a;
+  font-size: 9px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.matsya-map-popup-body b {
+  color: #263f56;
+  font-size: 11px;
+}
+
+.matsya-map-popup-footer {
+  display: grid;
+  gap: 8px;
+  padding-top: 9px;
+  border-top: 1px solid #e4edf5;
+}
+
+.matsya-map-popup-footer button {
+  justify-self: start;
+  padding: 7px 9px;
+  border: 0;
+  border-radius: 7px;
+  background: #0879c9;
+  color: #fff;
+  font-size: 10px;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.matsya-map-popup-footer button:hover {
+  background: #0566ad;
+}
+
+.matsya-map-popup-demo-note,
+.matsya-map-popup-disclaimer {
+  color: #8b641d;
+  font-size: 9px;
+  line-height: 1.45;
+}
+
+.matsya-map-popup-disclaimer {
+  color: #73879a;
+}
+
+.matsya-map-message {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin: 12px 14px 0;
+  padding: 10px 12px;
+  border: 1px solid #f0d7ad;
+  border-radius: 9px;
+  background: #fff9ee;
+  color: #82551d;
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.matsya-map-message.info {
+  border-color: #cfe3f5;
+  background: #f2f8fe;
+  color: #426582;
+}
+
+.matsya-map-message .secondary-button {
+  padding: 6px 9px;
+  border: 1px solid #b9d6ed;
+  border-radius: 7px;
+  background: #fff;
+  color: #1765a2;
+  font-size: 10px;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.matsya-feed-footnote {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 11px 14px 13px;
+  color: #6d8499;
+  font-size: 10px;
+  line-height: 1.55;
+}
+
+.matsya-feed-footnote svg {
+  flex: 0 0 14px;
+  margin-top: 1px;
+  color: #1684d6;
+}
+
+@media (max-width: 640px) {
+  .matsya-map-header {
+    padding: 10px;
+  }
+
+  .matsya-map-mode-btn {
+    flex: 1 1 140px;
+    font-size: 10px;
+  }
+
+  .feed-indicator {
+    margin-left: 0;
+  }
+
+  .matsya-leaflet-map {
+    height: 360px;
+    min-height: 360px;
+  }
+}

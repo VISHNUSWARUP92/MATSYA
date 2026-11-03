@@ -1,14 +1,23 @@
+import sys
 
+from pathlib import Path
+
+# Ensure backend directory is in sys.path for direct scripts and module imports
+
+BASE_DIR = Path(__file__).resolve().parent
+
+if str(BASE_DIR) not in sys.path:
+
+    sys.path.insert(0, str(BASE_DIR))
 
 from contextlib import asynccontextmanager
 
 from email import policy
 
 from email.parser import BytesParser
+from email_comparator import compare_emails
 
 from hashlib import sha256
-
-from pathlib import Path
 
 from urllib.parse import urlparse
 
@@ -18,7 +27,13 @@ import json
 
 import re
 
+import asyncio
 
+from datetime import datetime, timezone
+
+from urllib.request import Request, urlopen
+
+from urllib.error import URLError
 
 import joblib
 
@@ -28,17 +43,11 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from sqlalchemy import inspect, text
 
-
-
 from database import engine, SessionLocal
 
 from models import InvestigationCase, create_tables
 
 from intelligence import router as intelligence_router
-
-
-
-
 
 # --------------------------------------------------
 
@@ -46,25 +55,269 @@ from intelligence import router as intelligence_router
 
 # --------------------------------------------------
 
-
-
 MAX_FILE_SIZE = 10 * 1024 * 1024
 
 BASE_DIR = Path(__file__).resolve().parent
 
 MODEL_PATH = BASE_DIR / "email_model.joblib"
 
+# --------------------------------------------------
 
+# EMAIL ROUTE + GEOLOCATION HELPERS
 
+# --------------------------------------------------
 
+IPV4_PATTERN = re.compile(
+
+    r"(?<![\w.])(?:\d{1,3}\.){3}\d{1,3}(?![\w.])"
+
+)
+
+def is_public_ipv4(value: str) -> bool:
+
+    """
+
+    Return True only for globally routable IPv4 addresses.
+
+    """
+
+    try:
+
+        ip = ipaddress.ip_address(value)
+
+        if ip.version != 4:
+
+            return False
+
+        return bool(
+
+            ip.is_global
+
+            and not ip.is_private
+
+            and not ip.is_loopback
+
+            and not ip.is_multicast
+
+            and not ip.is_reserved
+
+        )
+
+    except ValueError:
+
+        return False
+
+def extract_received_chain(message):
+
+    """
+
+    Extract public IPv4 addresses from Received headers.
+
+    IMPORTANT:
+
+    Received headers are added hop-by-hop. Header ordering can vary
+
+    depending on the mail infrastructure, so the result is treated
+
+    as a forensic heuristic rather than proof of sender location.
+
+    """
+
+    received_headers = message.get_all("Received", [])
+
+    route = []
+
+    for index, header in enumerate(received_headers):
+
+        header_text = str(header)
+
+        found_ips = IPV4_PATTERN.findall(header_text)
+
+        public_ips = []
+
+        for value in found_ips:
+
+            if is_public_ipv4(value) and value not in public_ips:
+
+                public_ips.append(value)
+
+        route.append({
+
+            "hop": index + 1,
+
+            "header": header_text,
+
+            "ips": public_ips,
+
+        })
+
+    return route
+
+def flatten_route_ips(received_chain):
+
+    """
+
+    Return unique public IPs while preserving route order.
+
+    """
+
+    result = []
+
+    for hop in received_chain:
+
+        for ip in hop.get("ips", []):
+
+            if ip not in result:
+
+                result.append(ip)
+
+    return result
+
+def determine_suspected_origin(received_chain):
+
+    """
+
+    Select an earliest public IPv4 candidate from the
+
+    Received header chain.
+
+    This identifies suspected originating infrastructure,
+
+    NOT the exact physical location of a person.
+
+    """
+
+    # The oldest Received header is generally closer to
+
+    # the originating mail infrastructure.
+
+    for hop in reversed(received_chain):
+
+        ips = hop.get("ips", [])
+
+        if ips:
+
+            return {
+
+                "ip": ips[0],
+
+                "confidence": 70,
+
+                "reason": (
+
+                    "Earliest public IPv4 candidate found "
+
+                    "in the Received header chain."
+
+                ),
+
+            }
+
+    return {
+
+        "ip": None,
+
+        "confidence": 0,
+
+        "reason": (
+
+            "No public IPv4 address was found "
+
+            "in Received headers."
+
+        ),
+
+    }
+
+def extract_domain_from_email(value: str):
+
+    """
+
+    Extract domain from an email address/header value.
+
+    """
+
+    match = re.search(
+
+        r"@([A-Za-z0-9.-]+.[A-Za-z]{2,})",
+
+        value or ""
+
+    )
+
+    if match:
+
+        return match.group(1).lower()
+
+    return None
+
+# --------------------------------------------------
+
+def lookup_ip_geolocation(ip: str):
+
+    """Return approximate GeoIP data for one globally routable IPv4."""
+
+    if not is_public_ipv4(ip):
+
+        return {"ip": ip, "status": "skipped", "reason": "IP is not globally routable."}
+
+    try:
+
+        request = Request(
+
+            f"https://ipwho.is/{ip}",
+
+            headers={"User-Agent": "MATSYA-Cyber-Intelligence/1.0"}
+
+        )
+
+        with urlopen(request, timeout=6) as response:
+
+            data = json.loads(response.read().decode("utf-8"))
+
+        if not data.get("success", False):
+
+            return {"ip": ip, "status": "unavailable", "reason": data.get("message", "GeoIP lookup failed.")}
+
+        connection = data.get("connection") or {}
+
+        return {
+
+            "ip": ip, "status": "success",
+
+            "city": data.get("city"), "region": data.get("region"),
+
+            "country": data.get("country"), "country_code": data.get("country_code"),
+
+            "latitude": data.get("latitude"), "longitude": data.get("longitude"),
+
+            "isp": connection.get("isp"), "asn": connection.get("asn"),
+
+            "provider": "ipwho.is",
+
+            "lookup_time": datetime.now(timezone.utc).isoformat(),
+
+            "location_type": "Approximate IP geolocation"
+
+        }
+
+    except (URLError, TimeoutError, ValueError, OSError) as exc:
+
+        return {"ip": ip, "status": "unavailable", "reason": str(exc)}
+
+# DATABASE INITIALIZATION
+
+# --------------------------------------------------
 
 def initialize_database():
 
-    """Create tables and safely update the existing cases table."""
+    """
+
+    Create tables and safely update the existing cases table.
+
+    """
 
     create_tables()
-
-
 
     inspector = inspect(engine)
 
@@ -76,9 +329,7 @@ def initialize_database():
 
     }
 
-
-
-    # The earlier version of the database may not have this column.
+    # Add evidence_hash if an older database does not contain it.
 
     if "evidence_hash" not in columns:
 
@@ -96,9 +347,11 @@ def initialize_database():
 
             )
 
+# --------------------------------------------------
 
+# FASTAPI LIFESPAN
 
-
+# --------------------------------------------------
 
 @asynccontextmanager
 
@@ -108,51 +361,41 @@ async def lifespan(app: FastAPI):
 
     yield
 
+# --------------------------------------------------
 
+# FASTAPI APP
 
-
+# --------------------------------------------------
 
 app = FastAPI(
 
     title="MATSYA Cyber Intelligence API",
 
-    description="Email forensics, experimental ML analysis, and SQLite case history",
+    description=(
 
-    version="1.3.0",
+        "Email forensics, experimental ML analysis, "
+
+        "routing intelligence and SQLite case history"
+
+    ),
+
+    version="1.4.0",
 
     lifespan=lifespan,
 
 )
 
+# --------------------------------------------------
 
+# CORS
 
-
-
-# Local development CORS settings.
+# --------------------------------------------------
 
 app.add_middleware(
 
     CORSMiddleware,
 
-    allow_origins=[
-
-        "http://localhost:5173",
-
-        "http://127.0.0.1:5173",
-
-        "http://localhost:5174",
-
-        "http://127.0.0.1:5174",
-        "http://localhost:5175",
-        "http://127.0.0.1:5175",
-        "http://localhost:5176",
-        "http://127.0.0.1:5176",
-
-        "http://localhost:5190",
-
-        "http://127.0.0.1:5190",
-
-    ],
+    allow_origins=["*"],
 
     allow_credentials=False,
 
@@ -162,23 +405,19 @@ app.add_middleware(
 
 )
 
+# --------------------------------------------------
 
+# PRESERVE THREAT INTELLIGENCE ENDPOINTS
 
-# Preserve existing threat-intelligence endpoints.
+# --------------------------------------------------
 
 app.include_router(intelligence_router)
-
-
-
-
 
 # --------------------------------------------------
 
 # OPTIONAL ML MODEL
 
 # --------------------------------------------------
-
-
 
 try:
 
@@ -194,17 +433,11 @@ except Exception as exc:
 
     print(f"ML model unavailable: {exc}")
 
-
-
-
-
 # --------------------------------------------------
 
-# HOME AND HEALTH
+# HOME
 
 # --------------------------------------------------
-
-
 
 @app.get("/")
 
@@ -222,17 +455,17 @@ def home():
 
     }
 
+# --------------------------------------------------
 
+# HEALTH CHECK
 
-
+# --------------------------------------------------
 
 @app.get("/api/health")
 
 def health():
 
     database_status = "connected"
-
-
 
     try:
 
@@ -246,11 +479,17 @@ def health():
 
         print(f"Database health check failed: {exc}")
 
-
-
     return {
 
-        "status": "healthy" if database_status == "connected" else "degraded",
+        "status": (
+
+            "healthy"
+
+            if database_status == "connected"
+
+            else "degraded"
+
+        ),
 
         "database_status": database_status,
 
@@ -258,21 +497,17 @@ def health():
 
     }
 
-
-
-
-
 # --------------------------------------------------
 
 # EMAIL ANALYSIS
 
 # --------------------------------------------------
 
-
-
 @app.post("/api/analyze")
 
 async def analyze_email(file: UploadFile = File(...)):
+
+    # Validate file extension.
 
     if not file.filename or not file.filename.lower().endswith(".eml"):
 
@@ -283,12 +518,60 @@ async def analyze_email(file: UploadFile = File(...)):
             detail="Please upload a valid .eml file.",
 
         )
+    
+@app.post("/api/compare-emails")
+async def compare_two_emails(
+    reference_file: UploadFile = File(...),
+    suspected_file: UploadFile = File(...)
+):
+    allowed_extension = ".eml"
+
+    reference_name = (reference_file.filename or "").lower()
+    suspected_name = (suspected_file.filename or "").lower()
+
+    if not reference_name.endswith(allowed_extension):
+        raise HTTPException(
+            status_code=400,
+            detail="Reference file must be an .eml file."
+        )
+
+    if not suspected_name.endswith(allowed_extension):
+        raise HTTPException(
+            status_code=400,
+            detail="Suspected file must be an .eml file."
+        )
+
+    reference_raw = await reference_file.read()
+    suspected_raw = await suspected_file.read()
+
+    if not reference_raw or not suspected_raw:
+        raise HTTPException(
+            status_code=400,
+            detail="Both email files must contain data."
+        )
+
+    if len(reference_raw) > MAX_FILE_SIZE or len(suspected_raw) > MAX_FILE_SIZE:
+        raise HTTPException(
+            status_code=413,
+            detail="Each email file must be under 10 MB."
+        )
+
+    try:
+        result = compare_emails(reference_raw, suspected_raw)
+        return {
+            "success": True,
+            "comparison": result
+        }
+    except Exception as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Email comparison failed: {str(exc)}"
+        )
 
 
+    # Read with size protection.
 
     raw = await file.read(MAX_FILE_SIZE + 1)
-
-
 
     if not raw:
 
@@ -300,8 +583,6 @@ async def analyze_email(file: UploadFile = File(...)):
 
         )
 
-
-
     if len(raw) > MAX_FILE_SIZE:
 
         raise HTTPException(
@@ -312,15 +593,19 @@ async def analyze_email(file: UploadFile = File(...)):
 
         )
 
-
+    # Evidence integrity hash.
 
     evidence_hash = sha256(raw).hexdigest()
 
-
+    # Parse EML.
 
     try:
 
-        message = BytesParser(policy=policy.default).parsebytes(raw)
+        message = BytesParser(
+
+            policy=policy.default
+
+        ).parsebytes(raw)
 
     except Exception as exc:
 
@@ -332,21 +617,27 @@ async def analyze_email(file: UploadFile = File(...)):
 
         ) from exc
 
+    # --------------------------------------------------
 
+    # EXTRACT EMAIL METADATA
 
-    # Extract email metadata.
+    # --------------------------------------------------
 
-    subject = str(message.get("subject", ""))
+    subject = str(message.get("Subject", ""))
 
-    sender = str(message.get("from", ""))
+    sender = str(message.get("From", ""))
 
-    recipient = str(message.get("to", ""))
+    recipient = str(message.get("To", ""))
 
-    date = str(message.get("date", ""))
+    cc = str(message.get("Cc", ""))
 
-    reply_to = str(message.get("reply-to", ""))
+    date = str(message.get("Date", ""))
 
+    reply_to = str(message.get("Reply-To", ""))
 
+    return_path = str(message.get("Return-Path", ""))
+
+    message_id = str(message.get("Message-ID", ""))
 
     headers = {
 
@@ -356,17 +647,119 @@ async def analyze_email(file: UploadFile = File(...)):
 
     }
 
+    # --------------------------------------------------
 
+    # RECEIVED HEADER ROUTE ANALYSIS
 
-    # Extract readable body text.
+    # --------------------------------------------------
+
+    received_chain = extract_received_chain(message)
+
+    route_ips = flatten_route_ips(received_chain)
+
+    suspected_origin = determine_suspected_origin(
+
+        received_chain
+
+    )
+
+    origin_ip = suspected_origin.get("ip")
+
+    # Only geolocate public IPs extracted from this uploaded email's Received chain.
+
+    geolocation_results = await asyncio.gather(
+
+        *[asyncio.to_thread(lookup_ip_geolocation, ip) for ip in route_ips[:20]]
+
+    )
+
+    geolocation_summary = {
+
+        "source": "current_uploaded_email",
+
+        "total_public_ips": len(route_ips),
+
+        "successful_lookups": sum(1 for item in geolocation_results if item.get("status") == "success"),
+
+        "failed_lookups": sum(1 for item in geolocation_results if item.get("status") == "unavailable"),
+
+        "locations": geolocation_results
+
+    }
+
+    # --------------------------------------------------
+
+    # EMAIL IDENTITY ANALYSIS
+
+    # --------------------------------------------------
+
+    sender_domain = extract_domain_from_email(sender)
+
+    reply_to_domain = extract_domain_from_email(reply_to)
+
+    return_path_domain = extract_domain_from_email(
+
+        return_path
+
+    )
+
+    identity_mismatch = False
+
+    identity_mismatch_reasons = []
+
+    if (
+
+        sender_domain
+
+        and reply_to_domain
+
+        and sender_domain != reply_to_domain
+
+    ):
+
+        identity_mismatch = True
+
+        identity_mismatch_reasons.append(
+
+            "From domain differs from Reply-To domain."
+
+        )
+
+    if (
+
+        sender_domain
+
+        and return_path_domain
+
+        and sender_domain != return_path_domain
+
+    ):
+
+        identity_mismatch = True
+
+        identity_mismatch_reasons.append(
+
+            "From domain differs from Return-Path domain."
+
+        )
+
+    # --------------------------------------------------
+
+    # EXTRACT READABLE BODY
+
+    # --------------------------------------------------
 
     body_parts = []
 
-
-
     for part in message.walk():
 
-        if part.get_content_type() in ("text/plain", "text/html"):
+        if part.get_content_type() in (
+
+            "text/plain",
+
+            "text/html",
+
+        ):
 
             try:
 
@@ -380,15 +773,27 @@ async def analyze_email(file: UploadFile = File(...)):
 
                 continue
 
-
-
     body = "\n".join(body_parts)
 
-    combined = raw.decode("utf-8", errors="replace")
+    # --------------------------------------------------
 
+    # RAW EMAIL TEXT
 
+    # --------------------------------------------------
 
-    # Extract URLs without opening them.
+    combined = raw.decode(
+
+        "utf-8",
+
+        errors="replace"
+
+    )
+
+    # --------------------------------------------------
+
+    # EXTRACT URLs
+
+    # --------------------------------------------------
 
     urls = sorted(
 
@@ -408,9 +813,11 @@ async def analyze_email(file: UploadFile = File(...)):
 
     )[:200]
 
+    # --------------------------------------------------
 
+    # EXTRACT DOMAINS
 
-    # Extract hostnames from URLs.
+    # --------------------------------------------------
 
     domains = sorted(
 
@@ -420,33 +827,29 @@ async def analyze_email(file: UploadFile = File(...)):
 
             for url in urls
 
-            if (parsed := urlparse(url)).hostname
+            if (
+
+                parsed := urlparse(url)
+
+            ).hostname
 
         }
 
     )
 
+    # --------------------------------------------------
 
+    # EXTRACT ALL IPV4 ADDRESSES
 
-    # Extract and validate IPv4 addresses.
+    # --------------------------------------------------
 
     candidates = set(
 
-        re.findall(
-
-            r"(?<![\w.])(?:\d{1,3}\.){3}\d{1,3}(?![\w.])",
-
-            combined,
-
-        )
+        IPV4_PATTERN.findall(combined)
 
     )
 
-
-
     ips = []
-
-
 
     for candidate in candidates:
 
@@ -462,11 +865,7 @@ async def analyze_email(file: UploadFile = File(...)):
 
             continue
 
-
-
     ips = sorted(set(ips))
-
-
 
     # --------------------------------------------------
 
@@ -474,41 +873,49 @@ async def analyze_email(file: UploadFile = File(...)):
 
     # --------------------------------------------------
 
-
-
     findings = []
 
     score = 10
 
-
+    # Missing sender.
 
     if not sender:
 
-        findings.append("Sender information is missing.")
+        findings.append(
+
+            "Sender information is missing."
+
+        )
 
         score += 20
 
-
+    # Missing subject.
 
     if not subject:
 
-        findings.append("Subject information is missing.")
+        findings.append(
+
+            "Subject information is missing."
+
+        )
 
         score += 10
 
-
+    # URL findings.
 
     if urls:
 
         findings.append(
 
-            f"{len(urls)} URL(s) extracted. Review destinations safely."
+            f"{len(urls)} URL(s) extracted. "
+
+            "Review destinations safely."
 
         )
 
         score += min(30, len(urls) * 10)
 
-
+    # General IP findings.
 
     if ips:
 
@@ -516,13 +923,55 @@ async def analyze_email(file: UploadFile = File(...)):
 
             f"{len(ips)} IPv4 address(es) found; "
 
-            "ownership and location are not verified."
+            "ownership and location require analyst validation."
 
         )
 
         score += min(15, len(ips) * 5)
 
+    # Routing intelligence.
 
+    if route_ips:
+
+        findings.append(
+
+            f"{len(route_ips)} public IPv4 address(es) "
+
+            "identified from the Received header routing chain."
+
+        )
+
+    # Suspected origin.
+
+    if origin_ip:
+
+        findings.append(
+
+            "Suspected originating infrastructure candidate: "
+
+            f"{origin_ip}."
+
+        )
+
+    # Identity mismatch.
+
+    if identity_mismatch:
+
+        for reason in identity_mismatch_reasons:
+
+            findings.append(
+
+                f"Identity anomaly detected: {reason}"
+
+            )
+
+        score += 15
+
+    # --------------------------------------------------
+
+    # SUSPICIOUS KEYWORDS
+
+    # --------------------------------------------------
 
     suspicious_words = [
 
@@ -540,19 +989,17 @@ async def analyze_email(file: UploadFile = File(...)):
 
     ]
 
-
-
     lowered = f"{subject} {body}".lower()
 
     matched = [
 
-        word for word in suspicious_words
+        word
+
+        for word in suspicious_words
 
         if word in lowered
 
     ]
-
-
 
     if matched:
 
@@ -566,35 +1013,53 @@ async def analyze_email(file: UploadFile = File(...)):
 
         score += min(30, 10 * len(matched))
 
+    # --------------------------------------------------
 
+    # EMAIL AUTHENTICATION RESULTS
 
-    auth_results = headers.get("authentication-results", "").lower()
+    # --------------------------------------------------
 
+    auth_results = headers.get(
 
+        "authentication-results",
+
+        ""
+
+    ).lower()
 
     if any(
 
         token in auth_results
 
-        for token in ("spf=fail", "dkim=fail", "dmarc=fail")
+        for token in (
+
+            "spf=fail",
+
+            "dkim=fail",
+
+            "dmarc=fail",
+
+        )
 
     ):
 
         findings.append(
 
-            "Authentication-Results indicates an SPF, DKIM, "
+            "Authentication-Results indicates an SPF, "
 
-            "or DMARC failure."
+            "DKIM, or DMARC failure."
 
         )
 
         score += 20
 
+    # --------------------------------------------------
 
+    # FINAL RISK SCORE
+
+    # --------------------------------------------------
 
     score = min(score, 100)
-
-
 
     if score >= 70:
 
@@ -608,17 +1073,15 @@ async def analyze_email(file: UploadFile = File(...)):
 
         risk_level = "Low"
 
-
-
     if not findings:
 
         findings.append(
 
-            "No indicators from the current basic rules were found."
+            "No indicators from the current basic rules "
+
+            "were found."
 
         )
-
-
 
     # --------------------------------------------------
 
@@ -626,33 +1089,43 @@ async def analyze_email(file: UploadFile = File(...)):
 
     # --------------------------------------------------
 
-
-
     ml_prediction = "unavailable"
 
     ml_probability = None
-
-
 
     if email_model is not None:
 
         ml_text = f"{subject}\n{body}"
 
-
-
         try:
 
-            ml_prediction = str(email_model.predict([ml_text])[0])
+            ml_prediction = str(
 
+                email_model.predict([ml_text])[0]
 
+            )
 
             if hasattr(email_model, "predict_proba"):
 
-                probabilities = email_model.predict_proba([ml_text])[0]
+                probabilities = (
 
-                classes = list(getattr(email_model, "classes_", []))
+                    email_model.predict_proba([ml_text])[0]
 
+                )
 
+                classes = list(
+
+                    getattr(
+
+                        email_model,
+
+                        "classes_",
+
+                        []
+
+                    )
+
+                )
 
                 phishing_index = next(
 
@@ -670,8 +1143,6 @@ async def analyze_email(file: UploadFile = File(...)):
 
                 )
 
-
-
                 if (
 
                     phishing_index is not None
@@ -682,11 +1153,15 @@ async def analyze_email(file: UploadFile = File(...)):
 
                     ml_probability = round(
 
-                        float(probabilities[phishing_index]), 4
+                        float(
+
+                            probabilities[phishing_index]
+
+                        ),
+
+                        4,
 
                     )
-
-
 
         except Exception as exc:
 
@@ -696,35 +1171,55 @@ async def analyze_email(file: UploadFile = File(...)):
 
             ml_probability = None
 
-
-
     # --------------------------------------------------
 
     # LIMITATIONS
 
     # --------------------------------------------------
 
-
-
     limitations = [
 
         "Risk score is based on basic heuristic rules.",
 
-        "The ML model uses a demonstration dataset and is not "
+        (
 
-        "reliable for real-world phishing decisions.",
+            "The ML model uses a demonstration dataset "
 
-        "No live IP/domain reputation or geolocation lookup is performed.",
+            "and is not reliable for real-world phishing decisions."
+
+        ),
+
+        (
+
+            "No live IP/domain reputation or geolocation "
+
+            "lookup is performed by this endpoint."
+
+        ),
 
         "Extracted URLs are not opened or executed.",
 
         "A low score does not prove an email is safe.",
 
-        "Extracted IP addresses and domains require analyst validation.",
+        (
+
+            "Extracted IP addresses and domains require "
+
+            "analyst validation."
+
+        ),
+
+        (
+
+            "IP routing analysis identifies approximate "
+
+            "network infrastructure and cannot identify "
+
+            "the exact physical location of an individual."
+
+        ),
 
     ]
-
-
 
     if ML_MODEL_STATUS != "loaded":
 
@@ -736,21 +1231,15 @@ async def analyze_email(file: UploadFile = File(...)):
 
         )
 
-
-
     # --------------------------------------------------
 
     # SAVE ANALYSIS TO SQLITE
 
     # --------------------------------------------------
 
-
-
     saved_case_id = None
 
     db = SessionLocal()
-
-
 
     try:
 
@@ -766,13 +1255,17 @@ async def analyze_email(file: UploadFile = File(...)):
 
             risk_level=risk_level,
 
-            findings=json.dumps(findings, ensure_ascii=False),
+            findings=json.dumps(
+
+                findings,
+
+                ensure_ascii=False
+
+            ),
 
             evidence_hash=evidence_hash,
 
         )
-
-
 
         db.add(saved_case)
 
@@ -782,23 +1275,21 @@ async def analyze_email(file: UploadFile = File(...)):
 
         saved_case_id = saved_case.id
 
-
-
     except Exception as exc:
 
         db.rollback()
 
         print(f"Database save failed: {exc}")
 
-
-
     finally:
 
         db.close()
 
+    # --------------------------------------------------
 
+    # API RESPONSE
 
-    # Preserve the existing analysis response fields.
+    # --------------------------------------------------
 
     return {
 
@@ -812,27 +1303,95 @@ async def analyze_email(file: UploadFile = File(...)):
 
         "report": {
 
+            # Basic email metadata.
+
             "subject": subject,
 
             "sender": sender,
 
             "recipient": recipient,
 
+            "cc": cc,
+
             "date": date,
 
             "reply_to": reply_to,
 
+            "return_path": return_path,
+
+            "message_id": message_id,
+
+            # Raw headers.
+
             "headers": headers,
+
+            # URL and domain intelligence.
 
             "urls": urls,
 
             "domains": domains,
 
+            # All IPv4 addresses found anywhere.
+
             "ips": ips,
+
+            # --------------------------------------------------
+
+            # IDENTITY FORENSICS
+
+            # --------------------------------------------------
+
+            "identity_analysis": {
+
+                "sender_domain": sender_domain,
+
+                "reply_to_domain": reply_to_domain,
+
+                "return_path_domain": return_path,
+
+                "identity_mismatch": identity_mismatch,
+
+                "reasons": identity_mismatch_reasons,
+
+            },
+
+            # --------------------------------------------------
+
+            # EMAIL ROUTING FORENSICS
+
+            # --------------------------------------------------
+
+            "network_route": {
+
+                "received_hops": [
+
+                    {
+
+                        "hop": hop["hop"],
+
+                        "ips": hop["ips"],
+
+                    }
+
+                    for hop in received_chain
+
+                ],
+
+                "route_ips": route_ips,
+
+                "suspected_origin": suspected_origin,
+
+            },
+
+            "geolocation": geolocation_summary,
+
+            # Risk.
 
             "risk_score": score,
 
             "risk_level": risk_level,
+
+            # ML.
 
             "ml_prediction": ml_prediction,
 
@@ -840,17 +1399,31 @@ async def analyze_email(file: UploadFile = File(...)):
 
             "ml_model_status": ML_MODEL_STATUS,
 
+            # Findings.
+
             "findings": findings,
 
+            # Limitations.
+
             "limitations": limitations,
+
+            # Professional forensic disclaimer.
+
+            "forensic_disclaimer": (
+
+                "Network and IP analysis identifies "
+
+                "approximate infrastructure information. "
+
+                "It does not identify an individual's "
+
+                "exact physical location."
+
+            ),
 
         },
 
     }
-
-
-
-
 
 # --------------------------------------------------
 
@@ -858,15 +1431,11 @@ async def analyze_email(file: UploadFile = File(...)):
 
 # --------------------------------------------------
 
-
-
 @app.get("/api/cases")
 
 def get_cases():
 
     db = SessionLocal()
-
-
 
     try:
 
@@ -874,13 +1443,15 @@ def get_cases():
 
             db.query(InvestigationCase)
 
-            .order_by(InvestigationCase.id.desc())
+            .order_by(
+
+                InvestigationCase.id.desc()
+
+            )
 
             .all()
 
         )
-
-
 
         return {
 
@@ -906,9 +1477,9 @@ def get_cases():
 
                         json.loads(case.findings)
 
-                        if case.findings
+                        if case.findings and isinstance(case.findings, str) and case.findings.startswith(("[", "{"))
 
-                        else []
+                        else [case.findings] if case.findings else []
 
                     ),
 
@@ -932,15 +1503,15 @@ def get_cases():
 
         }
 
-
-
     finally:
 
         db.close()
 
+# --------------------------------------------------
 
+# SINGLE CASE API
 
-
+# --------------------------------------------------
 
 @app.get("/api/cases/{case_id}")
 
@@ -948,21 +1519,21 @@ def get_case(case_id: int):
 
     db = SessionLocal()
 
-
-
     try:
 
         case = (
 
             db.query(InvestigationCase)
 
-            .filter(InvestigationCase.id == case_id)
+            .filter(
+
+                InvestigationCase.id == case_id
+
+            )
 
             .first()
 
         )
-
-
 
         if case is None:
 
@@ -974,17 +1545,21 @@ def get_case(case_id: int):
 
             )
 
-
-
         try:
 
-            findings = json.loads(case.findings) if case.findings else []
+            findings = (
+
+                json.loads(case.findings)
+
+                if case.findings
+
+                else []
+
+            )
 
         except json.JSONDecodeError:
 
             findings = []
-
-
 
         return {
 
@@ -1016,8 +1591,68 @@ def get_case(case_id: int):
 
         }
 
-
-
     finally:
 
         db.close()
+
+
+
+# --------------------------------------------------
+# DELETE INVESTIGATION CASE
+# --------------------------------------------------
+
+@app.delete("/api/cases/{case_id}")
+def delete_case(case_id: int):
+    """Permanently delete one investigation case from SQLite."""
+    db = SessionLocal()
+
+    try:
+        case = (
+            db.query(InvestigationCase)
+            .filter(InvestigationCase.id == case_id)
+            .first()
+        )
+
+        if case is None:
+            raise HTTPException(
+                status_code=404,
+                detail="Investigation case not found.",
+            )
+
+        db.delete(case)
+        db.commit()
+
+        return {
+            "status": "success",
+            "message": "Investigation case deleted successfully.",
+            "case_id": case_id,
+        }
+
+    except HTTPException:
+        db.rollback()
+        raise
+    except Exception as exc:
+        db.rollback()
+        raise HTTPException(
+            status_code=500,
+            detail=f"Unable to delete investigation case: {exc}",
+        ) from exc
+    finally:
+        db.close()
+
+
+if __name__ == "__main__":
+
+    import uvicorn
+
+    print("=" * 60)
+
+    print("MATSYA Cyber Forensics Engine — FastAPI Server")
+
+    print("API Endpoint : http://127.0.0.1:8000")
+
+    print("Swagger Docs : http://127.0.0.1:8000/docs")
+
+    print("=" * 60)
+
+    uvicorn.run("main:app", host="127.0.0.1", port=8000, reload=True)
